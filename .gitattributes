@@ -1,0 +1,27 @@
+# Default: LF line endings for all text files, auto-detect binary.
+* text=auto eol=lf
+
+# Windows scripts must keep CRLF or they break when executed.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Rust / Cargo manifests — LF.
+*.rs   text eol=lf
+*.toml text eol=lf
+*.md   text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+
+# Binary artefacts.
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.webp binary
+*.ico  binary
+*.pdb  binary
+*.dll  binary
+*.exe  binary
+*.lib  binary
+*.bin  binary

@@ -1,0 +1,14 @@
+/target
+/Cargo.lock
+*.pdb
+.idea/
+.vscode/*
+!.vscode/settings.json
+*.swp
+*.swo
+Thumbs.db
+.DS_Store
+
+# Maintainer-local Claude infrastructure.
+/CLAUDE.md
+/.claude/
