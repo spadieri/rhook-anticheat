@@ -13,9 +13,12 @@ path = "src/main.rs"
 
 [dependencies]
 rhook-common = { git = "https://github.com/spadieri/rhook.git", rev = "4a34389f840d5c221848a8c7a0bcf71794d50ea2" }
+sha2 = "0.11.1"
 windows = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Security_Cryptography",
+    "Win32_Security_WinTrust",
     "Win32_Storage_FileSystem",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Diagnostics_ToolHelp",
