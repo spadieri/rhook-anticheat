@@ -28,19 +28,27 @@
 //! 5. **Executable memory outside any listed image** -- manual mapping,
 //!    shellcode, trampolines. See `exec_memory`.
 //!
+//! Every hook check 2 finds is followed to where it finally sends
+//! execution (`hooks`). One that ends in a module with a valid signature
+//! -- the Steam overlay is the everyday case -- is counted and named in
+//! the pass summary instead of raised as an alert. That is a judgement
+//! about the signer, not about the hook: anyone can buy a code-signing
+//! certificate, so the summary always says who was let through.
+//!
 //! Educational companion to rhook's `hook-engine`: both are built on the
 //! same primitives, aimed in opposite directions.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod exec_memory;
+mod hooks;
 mod image;
 mod log;
 mod remote_pe;
 mod threads;
 mod trust;
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::path::Path;
 use std::process::ExitCode;
@@ -51,6 +59,7 @@ use rhook_common::{memory, module, process};
 use windows::Win32::Foundation::HANDLE;
 
 use crate::exec_memory::ExecScan;
+use crate::hooks::{Destination, Redirect, Resolver};
 use crate::log::Log;
 use crate::trust::{Location, ManifestCheck, Signature, Trust};
 
@@ -396,9 +405,24 @@ fn scan_once(
             v
         };
 
+        // ---- 2a. executable memory outside images -------------------
+        //
+        // Walked before the integrity check, not after: a hook usually
+        // jumps into one of these allocations, and attribution needs to
+        // know them.
+        let scan = exec_memory::scan(handle, &modules);
+        report_exec_memory(log, &scan, seen);
+
+        let mut attr = Attributor {
+            resolver: Resolver::new(handle, &modules, &scan),
+            pid,
+            trust: &mut *trust,
+            paths: HashMap::new(),
+            vouched: BTreeMap::new(),
+        };
         let mut total = ScanStats::default();
         for mi in targets {
-            total += check_module(log, handle, pid, &mi.name, mi.base_address, seen);
+            total += check_module(log, handle, pid, &mi.name, mi.base_address, &mut attr, seen);
         }
 
         log.info(format!(
@@ -409,10 +433,15 @@ fn scan_once(
             total.exports_checked,
             total.regions
         ));
+        // Counted per finding, so a hook reported both as a tampered
+        // prologue and as a modified region counts twice -- the same
+        // unit as the alerts it replaces.
+        for (module, n) in &attr.vouched {
+            log.info(format!(
+                "integrity: {n} finding(s) lead into {module}, which has a valid signature -- not raised as alerts"
+            ));
+        }
 
-        // ---- 2b. executable memory outside images -------------------
-        let scan = exec_memory::scan(handle, &modules);
-        report_exec_memory(log, &scan, seen);
         exec = Some(scan);
 
         unsafe { process::close_handle(handle) };
@@ -660,6 +689,69 @@ fn report_exec_memory(log: &mut Log, scan: &ExecScan, seen: &mut Seen) {
     }
 }
 
+/// Follows hooks to their destination and decides whether whoever is
+/// there vouches for them.
+struct Attributor<'a> {
+    resolver: Resolver<'a>,
+    pid: u32,
+    trust: &'a mut Trust,
+    /// Module file paths by base, so each module's toolhelp walk runs
+    /// once per pass rather than once per hook.
+    paths: HashMap<usize, Option<String>>,
+    /// Hooks let through this pass, by the signed module they end in.
+    vouched: BTreeMap<String, usize>,
+}
+
+impl Attributor<'_> {
+    /// Where the hook at `addr` leads, and whether a module vouches for
+    /// it: one with a valid Authenticode signature, which is then counted
+    /// in `vouched`. A hook whose chain could not be followed, that ends
+    /// outside every module, or that went through a dispatch thunk (see
+    /// `hooks`) is never vouched for.
+    fn attribute(&mut self, addr: usize) -> (Option<Redirect>, bool) {
+        let redirect = self.resolver.follow(addr);
+        let vouched = match &redirect {
+            Some(Redirect {
+                dest: Destination::Module { name, base, .. },
+                via_thunk: false,
+                ..
+            }) => {
+                let pid = self.pid;
+                let path = self
+                    .paths
+                    .entry(*base)
+                    .or_insert_with(|| image::module_path(pid, *base));
+                match path.as_deref() {
+                    Some(p) if self.trust.verdict(p).signed() => Some(name.clone()),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        if let Some(name) = &vouched {
+            *self.vouched.entry(name.clone()).or_default() += 1;
+        }
+        (redirect, vouched.is_some())
+    }
+}
+
+/// The "where it goes" line appended to a code-change alert.
+fn redirect_line(r: &Option<Redirect>) -> String {
+    match r {
+        Some(r) => format!(
+            "\n              leads to:  {} ({} jump(s){})",
+            r.dest,
+            r.hops,
+            if r.via_thunk {
+                ", through a dispatch thunk: what actually runs is decided at run time"
+            } else {
+                ""
+            }
+        ),
+        None => "\n              leads to:  not a recognised jump".to_string(),
+    }
+}
+
 /// Per-pass totals. With a hundred-odd modules the per-module lines
 /// belong in the transcript, not on the console; these counts are what
 /// stays visible.
@@ -728,6 +820,7 @@ fn check_module(
     pid: u32,
     module_name: &str,
     module_base: usize,
+    attr: &mut Attributor<'_>,
     seen: &mut Seen,
 ) -> ScanStats {
     let mut stats = ScanStats::default();
@@ -864,16 +957,20 @@ fn check_module(
             RefSource::Disk => "on disk",
             RefSource::SelfProcess(_) => "reference",
         };
+        let (redirect, vouched) = attr.attribute(e.address);
         let msg = format!(
-            "prologue tampered: {module_name}!{} (ordinal {}, rva 0x{:X}) @ 0x{:X}\n              {want_label}: {}\n              in memory: {}",
+            "prologue tampered: {module_name}!{} (ordinal {}, rva 0x{:X}) @ 0x{:X}\n              {want_label}: {}\n              in memory: {}{}",
             e.name,
             e.ordinal,
             e.rva,
             e.address,
             hex(&want),
-            hex(&got)
+            hex(&got),
+            redirect_line(&redirect)
         );
-        if seen.prologues.insert(key) {
+        if vouched {
+            log.debug(format!("(signed destination) {msg}"));
+        } else if seen.prologues.insert(key) {
             log.alert(msg);
         } else {
             log.debug(format!("(still tampered) {msg}"));
@@ -895,6 +992,7 @@ fn check_module(
         module_base,
         &reference,
         &scan.exports,
+        attr,
         seen,
     );
     stats.regions = regions;
@@ -910,6 +1008,7 @@ fn check_module(
 /// normal target is one of the latter -- reached through the runtime
 /// catalog, not through exports. Comparing whole sections is the only way
 /// to see those hooks.
+#[allow(clippy::too_many_arguments)] // the module's identity, its reference and the pass state
 fn check_text_integrity(
     log: &mut Log,
     handle: HANDLE,
@@ -917,6 +1016,7 @@ fn check_text_integrity(
     module_base: usize,
     reference: &Reference<'_>,
     exports: &[remote_pe::RemoteExport],
+    attr: &mut Attributor<'_>,
     seen: &mut Seen,
 ) -> (usize, usize) {
     let clean = reference.clean;
@@ -1012,12 +1112,16 @@ fn check_text_integrity(
             let ref_label = reference.label();
 
             let key = format!("{module_name}!{sec_name}@0x{start:X}");
+            let (redirect, vouched) = attr.attribute(addr);
             let msg = format!(
-                "code modified: {module_name}!{sec_name} rva 0x{start:X} @ 0x{addr:X}, {len} byte(s){nearest}\n              {ref_label}: {}\n              in memory: {}",
+                "code modified: {module_name}!{sec_name} rva 0x{start:X} @ 0x{addr:X}, {len} byte(s){nearest}\n              {ref_label}: {}\n              in memory: {}{}",
                 hex(&want),
-                hex(&got)
+                hex(&got),
+                redirect_line(&redirect)
             );
-            if seen.prologues.insert(key) {
+            if vouched {
+                log.debug(format!("(signed destination) {msg}"));
+            } else if seen.prologues.insert(key) {
                 log.alert(msg);
             } else {
                 log.debug(format!("(still modified) {msg}"));
