@@ -147,6 +147,15 @@ Known limits:
    hooks above.
 2. **Patchless hooks** — read each game thread's debug registers with
    `GetThreadContext`, and flag `PAGE_GUARD` pages inside module code.
+3. **Platform posture** — a kernel-mode cheat is out of scope, but it
+   needs a weakened system to load, and that is visible from user mode:
+   Memory Integrity (HVCI) off, Microsoft's vulnerable driver blocklist
+   disabled (`HKLM\SYSTEM\CurrentControlSet\Control\CI\Config`,
+   `VulnerableDriverBlocklistEnable = 0`), Secure Boot off, test signing
+   on. A commercial cheat's setup guide asks for exactly these, so its
+   loader can map an unsigned driver through a signed but vulnerable one
+   (BYOVD). Report them as a posture warning, the way Vanguard and FACEIT
+   refuse to run without HVCI and Secure Boot.
 
 ## License
 
