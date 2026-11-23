@@ -50,6 +50,35 @@ actually running against what should be running:
   anything with a JIT, they are expected and reported for the reader to
   judge.
 
+- **Hardware identity, read more than one way** — once per run, before
+  the process checks, and about the machine rather than the target.
+  Hardware bans are built on SMBIOS serials, disk serials and MAC
+  addresses; a *HWID spoofer* rewrites what Windows reports for them.
+  This stage does not identify the machine — it stores and sends
+  nothing, and masks every value that could identify the machine
+  (placeholders and the CPU signature, which every CPU of a model shares,
+  are printed as they are). It checks that the different
+  paths to the same identifier agree, which on an honest machine they
+  always do:
+
+  | Identifier | Compared |
+  | --- | --- |
+  | SMBIOS system UUID; system, baseboard, chassis and memory serials | `GetSystemFirmwareTable` against WMI `MSSmBios_RawSMBiosTables` |
+  | Disk serial | the storage descriptor (what `Win32_DiskDrive` shows) against the drive's own IDENTIFY data, NVMe or ATA, fetched now |
+  | MAC address | IP Helper against NDIS's current address; the current address against the permanent one, explained by the registry `NetworkAddress` override or Wi-Fi random addresses where they apply |
+  | CPU | SMBIOS ProcessorID's signature against `CPUID` |
+
+  Two answers for the same SMBIOS field, disk serial or current MAC that
+  disagree are an alert. Everything with an honest explanation is a
+  warning or a note: a MAC that differs from the permanent one for a
+  reason Windows offers, a random Wi-Fi address that may be mid-change,
+  and a CPU signature mismatch (a hypervisor can mask `CPUID`).
+  Placeholder serials (`Default string`,
+  `To be filled by O.E.M.`, all zeros) are noted: they cannot identify
+  the machine. The registry's own copy of the SMBIOS table
+  (`mssmbios\Data\SMBiosData`) is deliberately *not* a view: Windows
+  zeroes the UUID and empties the serials in it.
+
 Every stage reports **what it examined**, not only what it objected to,
 and regions it could not validate are counted rather than passed over —
 an unchecked region is a coverage gap, not a clean bill of health.
@@ -83,9 +112,27 @@ Options:
 | `--module <name>` | Also check a module by name. Repeatable. |
 | `--manifest <file>` | Check the game's `.dll`/`.exe` files against a hash manifest. |
 | `--write-manifest <file>` | Hash every `.dll`/`.exe` under the target's directory into a manifest and exit. Run it on a clean install. It walks the whole directory, so point it at a game, not at something living in `C:\Windows`. |
+| `--no-hwid` | Skip the hardware-identity check. |
 
 By default **every** module in the target is checked. `--module` adds to
 that; it does not narrow it.
+
+### Testing the hardware check
+
+A clean machine raises nothing, which proves nothing. To see the check
+fire on real hardware, run, as administrator:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tests\spoof-sim.ps1
+```
+
+It builds the scanner with `--features spoof-sim`, a test-only build in
+which `RHOOK_SPOOF_SIM` alters one path's answer in memory (the SMBIOS
+UUID, a disk serial, a MAC, the CPUID signature) after it was read for
+real, as an incomplete spoofer would. Each scenario checks the alert,
+the masking and the exit code; the last one checks that the normal
+build ignores the variable. Nothing on the machine is changed. See
+`src/hwid/sim.rs`.
 
 `rhook-common` is fetched over git. If cargo's built-in git transport
 cannot authenticate, use the git CLI instead:
@@ -134,6 +181,13 @@ Known limits:
   reasons that have nothing to do with hooking.
 - Windows-directory files are trusted by location: most are
   catalog-signed, which a `WinVerifyTrust` call on the file cannot see.
+- **The hardware check catches incomplete spoofers only.** One that
+  answers every path consistently, patches the SMBIOS table before
+  Windows reads it, or changes the hardware itself passes. Reading a
+  disk's IDENTIFY data needs an administrator; without one the disks are
+  counted as not cross-checked. The ATA path is written against the SDK
+  layout but has not yet run on a SATA disk — the test machine has only
+  NVMe drives.
 - **Out of scope by construction:** external cheats that only read
   memory (ESP), cheats that only change values in memory, and kernel-mode
   or hypervisor-level cheats. This is a user-mode, in-process-tampering

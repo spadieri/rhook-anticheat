@@ -28,6 +28,11 @@
 //! 5. **Executable memory outside any listed image** -- manual mapping,
 //!    shellcode, trampolines. See `exec_memory`.
 //!
+//! Once per run, before any of that, a machine-wide check: whether the
+//! different ways of reading each hardware identifier (SMBIOS, disk
+//! serials, MACs, CPU signature) agree -- the trace an incomplete HWID
+//! spoofer leaves. It is about the machine, not the target. See `hwid`.
+//!
 //! Every hook check 2 finds is followed to where it finally sends
 //! execution (`hooks`). One that ends in a module with a valid signature
 //! -- the Steam overlay is the everyday case -- is counted and named in
@@ -42,6 +47,7 @@
 
 mod exec_memory;
 mod hooks;
+mod hwid;
 mod image;
 mod log;
 mod remote_pe;
@@ -105,6 +111,8 @@ struct Args {
     manifest: Option<String>,
     /// Write a manifest of the target's directory and exit.
     write_manifest: Option<String>,
+    /// Skip the hardware-identity consistency stage.
+    no_hwid: bool,
 }
 
 /// Findings already reported, so a `--watch` session logs an event once
@@ -129,11 +137,13 @@ fn parse_args() -> Option<Args> {
     let mut modules = Vec::new();
     let mut manifest = None;
     let mut write_manifest = None;
+    let mut no_hwid = false;
 
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
             "--watch" => watch = true,
+            "--no-hwid" => no_hwid = true,
             "--verbose" | "-v" => verbose = true,
             "--log" => {
                 i += 1;
@@ -172,13 +182,14 @@ fn parse_args() -> Option<Args> {
         modules,
         manifest,
         write_manifest,
+        no_hwid,
     })
 }
 
 fn usage() {
     eprintln!(
         "Usage: rhook-anticheat <process-name|pid> [--watch] [--verbose] [--log FILE] [--module NAME]...\n\
-                                [--manifest FILE | --write-manifest FILE]\n\
+                                [--manifest FILE | --write-manifest FILE] [--no-hwid]\n\
          \n\
            --watch                re-scan every 2s instead of a single pass\n\
            --verbose, -v          per-item detail on the console (always in --log)\n\
@@ -186,7 +197,8 @@ fn usage() {
            --module NAME          also check this module (repeatable)\n\
            --manifest FILE        check the game's files against a hash manifest\n\
            --write-manifest FILE  hash every .dll/.exe under the target's directory\n\
-                                  into FILE and exit (run it on a clean install)"
+                                  into FILE and exit (run it on a clean install)\n\
+           --no-hwid              skip the hardware-identity consistency check"
     );
 }
 
@@ -272,6 +284,15 @@ fn main() -> ExitCode {
         log.warn(
             "no --manifest: game files are judged by signature alone, and an unsigned GameAssembly.dll is normal",
         );
+    }
+
+    // ---- hardware identity ----------------------------------------
+    //
+    // Machine-wide and unchanging until a reboot, so once per run, not
+    // once per `--watch` pass.
+    if !args.no_hwid {
+        log.section("hardware identity");
+        hwid::check(&mut log);
     }
 
     // ---- baseline -------------------------------------------------
