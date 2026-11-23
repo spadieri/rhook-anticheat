@@ -13,21 +13,39 @@ path = "src/main.rs"
 
 [dependencies]
 rhook-common = { git = "https://github.com/spadieri/rhook.git", rev = "4a34389f840d5c221848a8c7a0bcf71794d50ea2" }
+sha2 = "0.11.1"
 windows = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
     "Win32_Security",
+    "Win32_Security_Cryptography",
+    "Win32_Security_WinTrust",
     "Win32_Storage_FileSystem",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Com",
     "Win32_System_IO",
+    "Win32_System_Ioctl",
     "Win32_System_Kernel",
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
+    "Win32_System_Ole",
     "Win32_System_Pipes",
+    "Win32_System_Registry",
+    "Win32_System_Rpc",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
+    "Win32_System_Variant",
+    "Win32_System_Wmi",
     "Win32_System_Console",
 ] }
+
+[features]
+# Test-only: lets RHOOK_SPOOF_SIM alter one path's answer in memory, to
+# prove the hardware-identity stage fires. See src/hwid/sim.rs.
+spoof-sim = []
 
 [profile.release]
 lto = true

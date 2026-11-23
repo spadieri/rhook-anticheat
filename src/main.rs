@@ -20,19 +20,43 @@
 //! 3. **Thread origins** outside any mapped module. Note the caveat in
 //!    `threads`: `LoadLibrary` injection is invisible to this one by
 //!    construction, and is check 1's job.
+//! 4. **Module provenance** -- where each module's file lives, whether it
+//!    is signed, whether it shadows a `System32` DLL, and (with
+//!    `--manifest`) whether a game file still hashes as shipped. This is
+//!    what catches a proxy DLL, which check 1 blesses because it is
+//!    already loaded at attach. See `trust`.
+//! 5. **Executable memory outside any listed image** -- manual mapping,
+//!    shellcode, trampolines. See `exec_memory`.
+//!
+//! Once per run, before any of that, a machine-wide check: whether the
+//! different ways of reading each hardware identifier (SMBIOS, disk
+//! serials, MACs, CPU signature) agree -- the trace an incomplete HWID
+//! spoofer leaves. It is about the machine, not the target. See `hwid`.
+//!
+//! Every hook check 2 finds is followed to where it finally sends
+//! execution (`hooks`). One that ends in a module with a valid signature
+//! -- the Steam overlay is the everyday case -- is counted and named in
+//! the pass summary instead of raised as an alert. That is a judgement
+//! about the signer, not about the hook: anyone can buy a code-signing
+//! certificate, so the summary always says who was let through.
 //!
 //! Educational companion to rhook's `hook-engine`: both are built on the
 //! same primitives, aimed in opposite directions.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+mod exec_memory;
+mod hooks;
+mod hwid;
 mod image;
 mod log;
 mod remote_pe;
 mod threads;
+mod trust;
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
+use std::path::Path;
 use std::process::ExitCode;
 use std::thread;
 use std::time::Duration;
@@ -40,7 +64,10 @@ use std::time::Duration;
 use rhook_common::{memory, module, process};
 use windows::Win32::Foundation::HANDLE;
 
+use crate::exec_memory::ExecScan;
+use crate::hooks::{Destination, Redirect, Resolver};
 use crate::log::Log;
+use crate::trust::{Location, ManifestCheck, Signature, Trust};
 
 /// Bytes compared at each export. Covers rhook's 14-byte absolute JMP and
 /// the 5-byte relative variant with room to spare.
@@ -80,6 +107,12 @@ struct Args {
     log_path: Option<String>,
     /// Extra modules to check beyond the target's own image.
     modules: Vec<String>,
+    /// Manifest of the game's files to check against.
+    manifest: Option<String>,
+    /// Write a manifest of the target's directory and exit.
+    write_manifest: Option<String>,
+    /// Skip the hardware-identity consistency stage.
+    no_hwid: bool,
 }
 
 /// Findings already reported, so a `--watch` session logs an event once
@@ -89,6 +122,10 @@ struct Seen {
     modules: HashSet<String>,
     prologues: HashSet<String>,
     threads: HashSet<u32>,
+    /// Provenance findings, keyed on finding kind and normalised path.
+    trust: HashSet<String>,
+    /// Foreign executable allocations, keyed on allocation base.
+    exec: HashSet<usize>,
 }
 
 fn parse_args() -> Option<Args> {
@@ -98,15 +135,27 @@ fn parse_args() -> Option<Args> {
     let mut verbose = false;
     let mut log_path = None;
     let mut modules = Vec::new();
+    let mut manifest = None;
+    let mut write_manifest = None;
+    let mut no_hwid = false;
 
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
             "--watch" => watch = true,
+            "--no-hwid" => no_hwid = true,
             "--verbose" | "-v" => verbose = true,
             "--log" => {
                 i += 1;
                 log_path = argv.get(i).cloned();
+            }
+            "--manifest" => {
+                i += 1;
+                manifest = argv.get(i).cloned();
+            }
+            "--write-manifest" => {
+                i += 1;
+                write_manifest = argv.get(i).cloned();
             }
             "--module" => {
                 i += 1;
@@ -131,17 +180,25 @@ fn parse_args() -> Option<Args> {
         verbose,
         log_path,
         modules,
+        manifest,
+        write_manifest,
+        no_hwid,
     })
 }
 
 fn usage() {
     eprintln!(
         "Usage: rhook-anticheat <process-name|pid> [--watch] [--verbose] [--log FILE] [--module NAME]...\n\
+                                [--manifest FILE | --write-manifest FILE] [--no-hwid]\n\
          \n\
-           --watch        re-scan every 2s instead of a single pass\n\
-           --verbose, -v  per-item detail on the console (always in --log)\n\
-           --log FILE     write the full transcript, including debug detail\n\
-           --module NAME  also check this module (repeatable)"
+           --watch                re-scan every 2s instead of a single pass\n\
+           --verbose, -v          per-item detail on the console (always in --log)\n\
+           --log FILE             write the full transcript, including debug detail\n\
+           --module NAME          also check this module (repeatable)\n\
+           --manifest FILE        check the game's files against a hash manifest\n\
+           --write-manifest FILE  hash every .dll/.exe under the target's directory\n\
+                                  into FILE and exit (run it on a clean install)\n\
+           --no-hwid              skip the hardware-identity consistency check"
     );
 }
 
@@ -164,6 +221,79 @@ fn main() -> ExitCode {
         },
     };
     log.info(format!("target: {} (pid {pid})", args.target));
+
+    // ---- provenance setup -----------------------------------------
+    //
+    // The game directory is what separates "shipped with the game" from
+    // "came from somewhere else", so it is resolved once, from the
+    // target's own image path.
+    let image_path = match process::open_process(pid) {
+        Ok(h) => {
+            let p = trust::process_image_path(h);
+            unsafe { process::close_handle(h) };
+            p
+        }
+        Err(e) => {
+            log.debug(format!("cannot open process for its image path: {e}"));
+            None
+        }
+    };
+    let game_dir = image_path
+        .as_deref()
+        .and_then(|p| Path::new(p).parent())
+        .map(|d| d.to_string_lossy().into_owned());
+
+    if let Some(out) = &args.write_manifest {
+        let Some(dir) = &game_dir else {
+            log.alert("cannot write a manifest: the target's image path is unknown");
+            return ExitCode::from(1);
+        };
+        return match trust::write_manifest(Path::new(dir), out) {
+            Ok(n) => {
+                log.info(format!(
+                    "manifest: {n} file(s) under {dir} hashed into {out}"
+                ));
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                log.alert(format!("cannot write manifest: {e}"));
+                ExitCode::from(1)
+            }
+        };
+    }
+
+    let manifest = match args.manifest.as_deref().map(trust::load_manifest) {
+        None => None,
+        Some(Ok(m)) => {
+            log.info(format!("manifest: {} file(s) listed", m.len()));
+            Some(m)
+        }
+        Some(Err(e)) => {
+            log.alert(format!("cannot load manifest: {e}"));
+            return ExitCode::from(1);
+        }
+    };
+    match &game_dir {
+        Some(d) => log.info(format!("game directory: {d}")),
+        None => log.warn(
+            "game directory unknown: every non-Windows module counts as 'other', and the manifest cannot be applied",
+        ),
+    }
+    let mut trust = Trust::new(game_dir, manifest);
+    if !trust.has_manifest() {
+        log.warn(
+            "no --manifest: game files are judged by signature alone, and an unsigned GameAssembly.dll is normal",
+        );
+    }
+
+    // ---- hardware identity ----------------------------------------
+    //
+    // Machine-wide and unchanging until a reboot, so once per run, not
+    // once per `--watch` pass.
+    if !args.no_hwid {
+        log.section("hardware identity");
+        hwid::check(&mut log);
+    }
 
     // ---- baseline -------------------------------------------------
     //
@@ -198,7 +328,7 @@ fn main() -> ExitCode {
     loop {
         pass += 1;
         log.section(&format!("pass {pass}"));
-        scan_once(&mut log, pid, &args, &baseline, &mut seen);
+        scan_once(&mut log, pid, &args, &baseline, &mut trust, &mut seen);
 
         if !args.watch {
             break;
@@ -219,7 +349,14 @@ fn main() -> ExitCode {
     }
 }
 
-fn scan_once(log: &mut Log, pid: u32, args: &Args, baseline: &HashSet<String>, seen: &mut Seen) {
+fn scan_once(
+    log: &mut Log,
+    pid: u32,
+    args: &Args,
+    baseline: &HashSet<String>,
+    trust: &mut Trust,
+    seen: &mut Seen,
+) {
     let modules = match module::list_modules(pid) {
         Ok(m) => m,
         Err(e) => {
@@ -254,6 +391,9 @@ fn scan_once(log: &mut Log, pid: u32, args: &Args, baseline: &HashSet<String>, s
         }
     }
 
+    // ---- 1b. module provenance ------------------------------------
+    check_provenance(log, pid, &modules, trust, seen);
+
     // ---- 2. prologue integrity ------------------------------------
     let handle = match process::open_process(pid) {
         Ok(h) => Some(h),
@@ -262,6 +402,10 @@ fn scan_once(log: &mut Log, pid: u32, args: &Args, baseline: &HashSet<String>, s
             None
         }
     };
+
+    // Kept past the handle's lifetime so a foreign thread can be matched
+    // to the allocation it starts in.
+    let mut exec: Option<ExecScan> = None;
 
     if let Some(handle) = handle {
         // Which modules to inspect. Empty `--module` means *all of them*:
@@ -282,9 +426,24 @@ fn scan_once(log: &mut Log, pid: u32, args: &Args, baseline: &HashSet<String>, s
             v
         };
 
+        // ---- 2a. executable memory outside images -------------------
+        //
+        // Walked before the integrity check, not after: a hook usually
+        // jumps into one of these allocations, and attribution needs to
+        // know them.
+        let scan = exec_memory::scan(handle, &modules);
+        report_exec_memory(log, &scan, seen);
+
+        let mut attr = Attributor {
+            resolver: Resolver::new(handle, &modules, &scan),
+            pid,
+            trust: &mut *trust,
+            paths: HashMap::new(),
+            vouched: BTreeMap::new(),
+        };
         let mut total = ScanStats::default();
         for mi in targets {
-            total += check_module(log, handle, pid, &mi.name, mi.base_address, seen);
+            total += check_module(log, handle, pid, &mi.name, mi.base_address, &mut attr, seen);
         }
 
         log.info(format!(
@@ -295,6 +454,16 @@ fn scan_once(log: &mut Log, pid: u32, args: &Args, baseline: &HashSet<String>, s
             total.exports_checked,
             total.regions
         ));
+        // Counted per finding, so a hook reported both as a tampered
+        // prologue and as a modified region counts twice -- the same
+        // unit as the alerts it replaces.
+        for (module, n) in &attr.vouched {
+            log.info(format!(
+                "integrity: {n} finding(s) lead into {module}, which has a valid signature -- not raised as alerts"
+            ));
+        }
+
+        exec = Some(scan);
 
         unsafe { process::close_handle(handle) };
     }
@@ -324,10 +493,21 @@ fn scan_once(log: &mut Log, pid: u32, args: &Args, baseline: &HashSet<String>, s
             let mut foreign = 0;
             for t in scan.foreign() {
                 foreign += 1;
+                let start = t.start.unwrap_or(0);
+                let region = exec
+                    .as_ref()
+                    .and_then(|e| e.regions.iter().find(|r| r.contains(start)))
+                    .map(|r| {
+                        format!(
+                            ", inside the {} executable allocation at 0x{:X}",
+                            r.kind.label(),
+                            r.allocation_base
+                        )
+                    })
+                    .unwrap_or_default();
                 let msg = format!(
-                    "thread {} starts at 0x{:X}, outside every mapped module",
-                    t.tid,
-                    t.start.unwrap_or(0)
+                    "thread {} starts at 0x{start:X}, outside every mapped module{region}",
+                    t.tid
                 );
                 if seen.threads.insert(t.tid) {
                     log.alert(msg);
@@ -345,6 +525,251 @@ fn scan_once(log: &mut Log, pid: u32, args: &Args, baseline: &HashSet<String>, s
             }
         }
         Err(e) => log.warn(format!("thread scan failed: {e}")),
+    }
+}
+
+/// Classify every module's file and report the ones nobody vouches for.
+///
+/// Findings are deduplicated on their kind and path, so `--watch` reports
+/// a proxy DLL once; the verdicts themselves are cached inside `Trust`.
+fn check_provenance(
+    log: &mut Log,
+    pid: u32,
+    modules: &[rhook_common::module::ModuleInfo],
+    trust: &mut Trust,
+    seen: &mut Seen,
+) {
+    let (mut system, mut game, mut other, mut no_path) = (0, 0, 0, 0);
+    let (mut signed, mut unsigned, mut invalid) = (0, 0, 0);
+    let (mut matched, mut mismatched, mut unknown, mut unhashed) = (0, 0, 0, 0);
+
+    for mi in modules {
+        let Some(path) = image::module_path(pid, mi.base_address) else {
+            no_path += 1;
+            log.debug(format!("  provenance: skip {}: no on-disk path", mi.name));
+            continue;
+        };
+        let v = trust.verdict(&path).clone();
+
+        match v.location {
+            Location::System => system += 1,
+            Location::Game => game += 1,
+            Location::Other => other += 1,
+        }
+        match &v.signature {
+            Some(Signature::Valid) => signed += 1,
+            Some(Signature::Unsigned) => unsigned += 1,
+            Some(Signature::Invalid(_)) => invalid += 1,
+            None => {}
+        }
+        match &v.manifest {
+            ManifestCheck::NotChecked => {}
+            ManifestCheck::Match => matched += 1,
+            ManifestCheck::Mismatch => mismatched += 1,
+            ManifestCheck::Unknown => unknown += 1,
+            ManifestCheck::Unreadable(_) => unhashed += 1,
+        }
+        log.debug(format!(
+            "  provenance: {:<32} {:?}, signature {}, manifest {:?}{} -- {path}",
+            mi.name,
+            v.location,
+            match &v.signature {
+                None => "not checked".to_string(),
+                Some(Signature::Valid) => "valid".to_string(),
+                Some(Signature::Unsigned) => "none".to_string(),
+                Some(Signature::Invalid(hr)) => format!("INVALID 0x{:08X}", *hr as u32),
+            },
+            v.manifest,
+            if v.shadows_system {
+                ", shadows System32"
+            } else {
+                ""
+            }
+        ));
+
+        // (dedup kind, alert rather than warning, message)
+        let mut findings: Vec<(&str, bool, String)> = Vec::new();
+        if let Some(Signature::Invalid(hr)) = v.signature {
+            findings.push((
+                "sig",
+                true,
+                format!(
+                    "signature does not verify: {} (0x{:08X}) -- {path}",
+                    mi.name, hr as u32
+                ),
+            ));
+        }
+        if v.shadows_system && !v.signed() {
+            findings.push((
+                "shadow",
+                true,
+                format!(
+                    "unsigned {} shadows a System32 DLL of the same name (proxy-DLL pattern) -- {path}",
+                    mi.name
+                ),
+            ));
+        }
+        match &v.manifest {
+            ManifestCheck::Mismatch => findings.push((
+                "manifest",
+                true,
+                format!("game file differs from the manifest: {} -- {path}", mi.name),
+            )),
+            ManifestCheck::Unknown => findings.push((
+                "manifest",
+                true,
+                format!(
+                    "game-directory module not in the manifest: {} -- {path}",
+                    mi.name
+                ),
+            )),
+            ManifestCheck::Unreadable(e) => findings.push((
+                "manifest",
+                false,
+                format!(
+                    "cannot hash {} for the manifest check: {e} -- {path}",
+                    mi.name
+                ),
+            )),
+            _ => {}
+        }
+        if v.location == Location::Other
+            && v.signature == Some(Signature::Unsigned)
+            && !v.shadows_system
+        {
+            findings.push((
+                "other",
+                false,
+                format!(
+                    "unsigned module from outside the game and Windows directories: {} -- {path}",
+                    mi.name
+                ),
+            ));
+        }
+
+        for (kind, alert, msg) in findings {
+            if seen
+                .trust
+                .insert(format!("{kind}:{}", path.to_ascii_lowercase()))
+            {
+                if alert {
+                    log.alert(msg);
+                } else {
+                    log.warn(msg);
+                }
+            } else {
+                log.debug(format!("(still present) {msg}"));
+            }
+        }
+    }
+
+    let manifest = if trust.has_manifest() {
+        format!(
+            "; manifest: {matched} match, {mismatched} differ, {unknown} unlisted, {unhashed} unreadable"
+        )
+    } else {
+        String::new()
+    };
+    log.info(format!(
+        "provenance: {system} system, {game} game, {other} other ({no_path} without a path); non-system: {signed} signed, {unsigned} unsigned, {invalid} invalid signature{manifest}"
+    ));
+}
+
+/// Report executable memory that no listed module accounts for.
+fn report_exec_memory(log: &mut Log, scan: &ExecScan, seen: &mut Seen) {
+    log.info(format!(
+        "exec memory: {} region(s) walked, {} MB executable inside modules, {} executable allocation(s) outside them",
+        scan.regions_walked,
+        scan.image_exec_bytes / (1024 * 1024),
+        scan.regions.len()
+    ));
+    if let Some(at) = scan.stopped_at {
+        log.warn(format!(
+            "exec memory: address-space walk stopped at 0x{at:X}, coverage is partial"
+        ));
+    }
+    for r in &scan.regions {
+        let msg = format!(
+            "executable {} memory at 0x{:X} (allocation 0x{:X}), {} KB{}\n              head: {}",
+            r.kind.label(),
+            r.first_exec,
+            r.allocation_base,
+            r.exec_bytes / 1024,
+            if r.writable { ", writable" } else { "" },
+            if r.head.is_empty() {
+                "<unreadable>".to_string()
+            } else {
+                hex(&r.head)
+            }
+        );
+        if seen.exec.insert(r.allocation_base) {
+            log.alert(msg);
+        } else {
+            log.debug(format!("(still present) {msg}"));
+        }
+    }
+}
+
+/// Follows hooks to their destination and decides whether whoever is
+/// there vouches for them.
+struct Attributor<'a> {
+    resolver: Resolver<'a>,
+    pid: u32,
+    trust: &'a mut Trust,
+    /// Module file paths by base, so each module's toolhelp walk runs
+    /// once per pass rather than once per hook.
+    paths: HashMap<usize, Option<String>>,
+    /// Hooks let through this pass, by the signed module they end in.
+    vouched: BTreeMap<String, usize>,
+}
+
+impl Attributor<'_> {
+    /// Where the hook at `addr` leads, and whether a module vouches for
+    /// it: one with a valid Authenticode signature, which is then counted
+    /// in `vouched`. A hook whose chain could not be followed, that ends
+    /// outside every module, or that went through a dispatch thunk (see
+    /// `hooks`) is never vouched for.
+    fn attribute(&mut self, addr: usize) -> (Option<Redirect>, bool) {
+        let redirect = self.resolver.follow(addr);
+        let vouched = match &redirect {
+            Some(Redirect {
+                dest: Destination::Module { name, base, .. },
+                via_thunk: false,
+                ..
+            }) => {
+                let pid = self.pid;
+                let path = self
+                    .paths
+                    .entry(*base)
+                    .or_insert_with(|| image::module_path(pid, *base));
+                match path.as_deref() {
+                    Some(p) if self.trust.verdict(p).signed() => Some(name.clone()),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        if let Some(name) = &vouched {
+            *self.vouched.entry(name.clone()).or_default() += 1;
+        }
+        (redirect, vouched.is_some())
+    }
+}
+
+/// The "where it goes" line appended to a code-change alert.
+fn redirect_line(r: &Option<Redirect>) -> String {
+    match r {
+        Some(r) => format!(
+            "\n              leads to:  {} ({} jump(s){})",
+            r.dest,
+            r.hops,
+            if r.via_thunk {
+                ", through a dispatch thunk: what actually runs is decided at run time"
+            } else {
+                ""
+            }
+        ),
+        None => "\n              leads to:  not a recognised jump".to_string(),
     }
 }
 
@@ -416,6 +841,7 @@ fn check_module(
     pid: u32,
     module_name: &str,
     module_base: usize,
+    attr: &mut Attributor<'_>,
     seen: &mut Seen,
 ) -> ScanStats {
     let mut stats = ScanStats::default();
@@ -552,16 +978,20 @@ fn check_module(
             RefSource::Disk => "on disk",
             RefSource::SelfProcess(_) => "reference",
         };
+        let (redirect, vouched) = attr.attribute(e.address);
         let msg = format!(
-            "prologue tampered: {module_name}!{} (ordinal {}, rva 0x{:X}) @ 0x{:X}\n              {want_label}: {}\n              in memory: {}",
+            "prologue tampered: {module_name}!{} (ordinal {}, rva 0x{:X}) @ 0x{:X}\n              {want_label}: {}\n              in memory: {}{}",
             e.name,
             e.ordinal,
             e.rva,
             e.address,
             hex(&want),
-            hex(&got)
+            hex(&got),
+            redirect_line(&redirect)
         );
-        if seen.prologues.insert(key) {
+        if vouched {
+            log.debug(format!("(signed destination) {msg}"));
+        } else if seen.prologues.insert(key) {
             log.alert(msg);
         } else {
             log.debug(format!("(still tampered) {msg}"));
@@ -583,6 +1013,7 @@ fn check_module(
         module_base,
         &reference,
         &scan.exports,
+        attr,
         seen,
     );
     stats.regions = regions;
@@ -598,6 +1029,7 @@ fn check_module(
 /// normal target is one of the latter -- reached through the runtime
 /// catalog, not through exports. Comparing whole sections is the only way
 /// to see those hooks.
+#[allow(clippy::too_many_arguments)] // the module's identity, its reference and the pass state
 fn check_text_integrity(
     log: &mut Log,
     handle: HANDLE,
@@ -605,6 +1037,7 @@ fn check_text_integrity(
     module_base: usize,
     reference: &Reference<'_>,
     exports: &[remote_pe::RemoteExport],
+    attr: &mut Attributor<'_>,
     seen: &mut Seen,
 ) -> (usize, usize) {
     let clean = reference.clean;
@@ -700,12 +1133,16 @@ fn check_text_integrity(
             let ref_label = reference.label();
 
             let key = format!("{module_name}!{sec_name}@0x{start:X}");
+            let (redirect, vouched) = attr.attribute(addr);
             let msg = format!(
-                "code modified: {module_name}!{sec_name} rva 0x{start:X} @ 0x{addr:X}, {len} byte(s){nearest}\n              {ref_label}: {}\n              in memory: {}",
+                "code modified: {module_name}!{sec_name} rva 0x{start:X} @ 0x{addr:X}, {len} byte(s){nearest}\n              {ref_label}: {}\n              in memory: {}{}",
                 hex(&want),
-                hex(&got)
+                hex(&got),
+                redirect_line(&redirect)
             );
-            if seen.prologues.insert(key) {
+            if vouched {
+                log.debug(format!("(signed destination) {msg}"));
+            } else if seen.prologues.insert(key) {
                 log.alert(msg);
             } else {
                 log.debug(format!("(still modified) {msg}"));
